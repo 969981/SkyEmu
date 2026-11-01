@@ -1,0 +1,250 @@
+name: SkyEmu Upstream Sync and Release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Build current upstream dev even without new commits'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/skyemu-auto-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: skyemu-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.ff.outputs.changed }}
+      sha: ${{ steps.ff.outputs.sha }}
+    steps:
+      - name: Checkout default branch for scheduled execution
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Safely fast-forward dev from official upstream
+        id: ff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/skylersaleh/SkyEmu.git
+          git fetch --no-tags upstream dev
+          git fetch --no-tags origin dev
+          previous="$(git rev-parse refs/remotes/origin/dev)"
+          latest="$(git rev-parse refs/remotes/upstream/dev)"
+          echo "sha=$latest" >> "$GITHUB_OUTPUT"
+          if [[ "$previous" == "$latest" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already synchronized: $latest"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$previous" "$latest"; then
+            echo "::error::Local dev diverged from upstream dev. Refusing to overwrite local commits."
+            exit 1
+          fi
+          git push origin "$latest:refs/heads/dev"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Updated dev: $previous -> $latest"
+
+  windows:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Build Windows x64
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION=10.0.19041.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config RelWithDebInfo --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package executable and accompanying files
+        shell: pwsh
+        run: |
+          $bin = 'build/bin/RelWithDebInfo'
+          if (!(Test-Path "$bin/SkyEmu.exe")) { throw 'Expected SkyEmu.exe not found' }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "$bin/*" -DestinationPath "dist/SkyEmu-Windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyemu-windows
+          path: dist/SkyEmu-Windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libx11-dev libxi-dev libxrandr-dev libxinerama-dev libxcursor-dev libgl1-mesa-dev libegl1-mesa-dev libasound2-dev
+      - name: Build Linux x86_64
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 4
+      - name: Package Linux files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/bin/SkyEmu
+          mkdir -p dist
+          tar -C build/bin -czf dist/SkyEmu-Linux-x86_64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyemu-linux
+          path: dist/SkyEmu-Linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Build universal macOS application
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build build --parallel 4
+          test -d build/bin/SkyEmu.app
+      - name: Package macOS DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          hdiutil create -volname SkyEmu -srcfolder build/bin/SkyEmu.app -ov -format UDZO dist/SkyEmu-macOS-Universal.dmg
+          test -s dist/SkyEmu-macOS-Universal.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyemu-macos
+          path: dist/SkyEmu-macOS-Universal.dmg
+          if-no-files-found: error
+
+  android:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - name: Build Android release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/android_project
+          chmod +x gradlew
+          ./gradlew assembleRelease
+      - name: Package Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mapfile -t apks < <(find tools/android_project/app/build/outputs/apk/release -type f -name '*.apk')
+          if (( ${#apks[@]} == 0 )); then
+            echo "::error::No release APK generated"
+            exit 1
+          fi
+          cp "${apks[0]}" dist/SkyEmu-Android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyemu-android
+          path: dist/SkyEmu-Android.apk
+          if-no-files-found: error
+
+  web:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.7
+          actions-cache-folder: emsdk-cache
+      - name: Build WebAssembly application
+        shell: bash
+        run: |
+          set -euo pipefail
+          emcmake cmake -S . -B build -DPLATFORM=Web
+          cmake --build build --parallel 4
+          test -f build/bin/SkyEmu.html
+          mv build/bin/SkyEmu.html build/bin/index.html
+      - name: Package offline Web build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          (cd build/bin && zip -qr "$GITHUB_WORKSPACE/dist/SkyEmu-Web.zip" .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyemu-web
+          path: dist/SkyEmu-Web.zip
+          if-no-files-found: error
+
+  release:
+    needs: [sync, windows, linux, macos, android, web]
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: skyemu-*
+          path: dist
+          merge-multiple: true
+      - name: Publish complete cross-platform development build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if (( ${#assets[@]} != 5 )); then
+            echo "::error::Expected five complete platform packages; found ${#assets[@]}"
+            exit 1
+          fi
+          tag="upstream-dev-${BUILD_SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists"
+            exit 0
+          fi
+          printf 'Based on upstream SkyEmu dev: https://github.com/skylersaleh/SkyEmu\nCommit: %s\n\nAutomated development build for Windows, Linux, macOS, Android, and Web. Unofficial and not an upstream stable release.\n' "$BUILD_SHA" > notes.txt
+          gh release create "$tag" "${assets[@]}" \
+            --target "$BUILD_SHA" \
+            --title "SkyEmu dev ${BUILD_SHA:0:12}" \
+            --notes-file notes.txt \
+            --prerelease
