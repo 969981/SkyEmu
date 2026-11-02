@@ -1,0 +1,33 @@
+name: Disable duplicate upstream SkyEmu Android and Web workflows
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/disable-legacy-ci-once.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  disable-legacy-ci:
+    if: github.repository == '969981/SkyEmu'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Disable redundant upstream Android and Web workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filename in deploy_android.yml deploy_web.yml; do
+            echo "Disabling ${filename}"
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${filename}/disable"
+            state="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${filename}" --jq .state)"
+            echo "${filename}: ${state}"
+            if [[ "${state}" != "disabled_manually" ]]; then
+              echo "::error::Expected disabled_manually for ${filename}, got ${state}"
+              exit 1
+            fi
+          done
